@@ -21,11 +21,6 @@ type Request struct {
 	Body        string `json:"body,omitempty"`
 }
 
-type Header struct {
-	Name  string `json:"name"`
-	Value string `json:"value"`
-}
-
 type Response struct {
 	Code    int `json:"code"`
 	Headers http.Header
@@ -42,6 +37,36 @@ type Requests []Request
 type BatchRequest struct {
 	AccessToken string   `json:"access_token"`
 	Batch       Requests `json:"batch"`
+}
+
+type RoundTripFunc func(*http.Request) (*http.Response, error)
+
+func (rt RoundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) {
+	return rt(r)
+}
+
+func LimitConcurrency(rt http.RoundTripper, limit int) http.RoundTripper {
+	limiter := make(chan struct{}, limit)
+	push := func() {
+		start := time.Now()
+		limiter <- struct{}{}
+		fmt.Println("time spent waiting:", time.Since(start))
+	}
+	pop := func() {
+		<-limiter
+	}
+	return RoundTripFunc(func(r *http.Request) (*http.Response, error) {
+		push()                 // reserve a slot
+		defer pop()            // free the slot back up
+		return rt.RoundTrip(r) // use the given round tripper
+	})
+}
+
+func Delay(rt http.RoundTripper, d time.Duration) http.RoundTripper {
+	return RoundTripFunc(func(r *http.Request) (*http.Response, error) {
+		time.Sleep(d)
+		return rt.RoundTrip(r)
+	})
 }
 
 func decodeRequests(req *http.Request) (batch BatchRequest, err error) {
@@ -76,42 +101,6 @@ func MakeRequest(client *http.Client, request Request) (response Response) {
 
 	jsonParsed, err := gabs.ParseJSON(body)
 	return Response{Code: res.StatusCode, Headers: res.Header, Body: json.RawMessage(jsonParsed.String())}
-}
-
-type RoundTripFunc func(*http.Request) (*http.Response, error)
-
-func (rt RoundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) {
-	return rt(r)
-}
-
-// LimitConcurrency limits how many requests can be processed at once
-func LimitConcurrency(rt http.RoundTripper, limit int) http.RoundTripper {
-	limiter := make(chan struct{}, limit)
-	push := func() {
-		start := time.Now()
-		limiter <- struct{}{}
-		fmt.Println("time spent waiting:", time.Since(start))
-	}
-	pop := func() {
-		<-limiter
-	}
-	return RoundTripFunc(func(r *http.Request) (*http.Response, error) {
-		// reserve a slot
-		push()
-		// free the slot back up
-		defer pop()
-
-		// use the given round tripper
-		return rt.RoundTrip(r)
-	})
-}
-
-// Delay the round-trip for some duration
-func Delay(rt http.RoundTripper, d time.Duration) http.RoundTripper {
-	return RoundTripFunc(func(r *http.Request) (*http.Response, error) {
-		time.Sleep(d)
-		return rt.RoundTrip(r)
-	})
 }
 
 func CreateBatchEndpoint(w http.ResponseWriter, req *http.Request) {
