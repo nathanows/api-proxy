@@ -6,13 +6,14 @@ import (
 	"io/ioutil"
 	"log"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/Jeffail/gabs"
 	"github.com/gorilla/mux"
 )
 
-const notificationsApi = "http://localhost:3000/"
+const baseApiUrl = "http://localhost:3000/"
 
 type Request struct {
 	Method      string `json:"method"`
@@ -27,8 +28,8 @@ type Header struct {
 
 type Response struct {
 	Code    int `json:"code"`
-	Headers []Header
-	Body    string `json:"body"`
+	Headers http.Header
+	Body    json.RawMessage `json:"body"`
 }
 
 type BatchResponse struct {
@@ -53,17 +54,15 @@ func decodeRequests(req *http.Request) (batch BatchRequest, err error) {
 	return batchRequest, nil
 }
 
-func MakeRequest(client http.Client, request Request, ch chan<- Response) {
+func MakeRequest(client *http.Client, request Request) (response Response) {
 	var method = request.Method
 	var relative_url = request.RelativeUrl
 
-	url := fmt.Sprintf("%s%s", notificationsApi, relative_url)
+	url := fmt.Sprintf("%s%s", baseApiUrl, relative_url)
 	req, err := http.NewRequest(method, url, nil)
 	if err != nil {
 		log.Fatal(err)
 	}
-
-	req.Header.Set("Authorization", "Basic dXNlcm5hbWU6cGFzc3dvcmQ=")
 
 	res, err := client.Do(req)
 	if err != nil {
@@ -76,31 +75,73 @@ func MakeRequest(client http.Client, request Request, ch chan<- Response) {
 	}
 
 	jsonParsed, err := gabs.ParseJSON(body)
-	resp := Response{Code: res.StatusCode, Body: jsonParsed.String()}
+	return Response{Code: res.StatusCode, Headers: res.Header, Body: json.RawMessage(jsonParsed.String())}
+}
 
-	ch <- resp
+type RoundTripFunc func(*http.Request) (*http.Response, error)
+
+func (rt RoundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) {
+	return rt(r)
+}
+
+// LimitConcurrency limits how many requests can be processed at once
+func LimitConcurrency(rt http.RoundTripper, limit int) http.RoundTripper {
+	limiter := make(chan struct{}, limit)
+	push := func() {
+		start := time.Now()
+		limiter <- struct{}{}
+		fmt.Println("time spent waiting:", time.Since(start))
+	}
+	pop := func() {
+		<-limiter
+	}
+	return RoundTripFunc(func(r *http.Request) (*http.Response, error) {
+		// reserve a slot
+		push()
+		// free the slot back up
+		defer pop()
+
+		// use the given round tripper
+		return rt.RoundTrip(r)
+	})
+}
+
+// Delay the round-trip for some duration
+func Delay(rt http.RoundTripper, d time.Duration) http.RoundTripper {
+	return RoundTripFunc(func(r *http.Request) (*http.Response, error) {
+		time.Sleep(d)
+		return rt.RoundTrip(r)
+	})
 }
 
 func CreateBatchEndpoint(w http.ResponseWriter, req *http.Request) {
+	start := time.Now()
+
 	batchRequest, err := decodeRequests(req)
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	apiClient := http.Client{Timeout: time.Second * 10}
-
 	var responses []Response
 
-	start := time.Now()
-	ch := make(chan Response)
+	delay := time.Millisecond * 100
+	delayed := Delay(http.DefaultTransport, delay)
+	apiClient := &http.Client{
+		Transport: LimitConcurrency(delayed, 10),
+		Timeout:   time.Second * 30,
+	}
 
+	wg := sync.WaitGroup{}
 	for _, request := range batchRequest.Batch {
-		go MakeRequest(apiClient, request, ch)
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			resp := MakeRequest(apiClient, request)
+			responses = append(responses, resp)
+		}()
 	}
+	wg.Wait()
 
-	for range batchRequest.Batch {
-		responses = append(responses, <-ch)
-	}
 	fmt.Printf("%.2fs elapsed\n", time.Since(start).Seconds())
 
 	json.NewEncoder(w).Encode(BatchResponse{Code: 200, Body: responses})
